@@ -199,6 +199,19 @@ const CONFIG = {
   // Защита от больших скачков времени (вкладка в фоне и т.п.)
   maxDeltaTime: 100,
 
+  // Пасхалка: быстро трясёшь мышью → логотип Яндекса с глитчами и Harlem Shake
+  shakeSpeedMin: 2.5,         // экранов/с — с этой скорости курсор считается «быстрым»
+  shakeSpeedFull: 7,          // экранов/с — максимальная скорость зарядки
+  shakeChargeTime: 450,       // мс активной тряски до запуска
+  shakeDecayTime: 1400,       // мс затухания после остановки
+  shakeDropDelay: 1400,       // мс «танцует один логотип» до дропа
+  shakeBpm: 140,              // темп дропа
+  shakeRingOffset: 16,        // px (на экране 800px) — разброс колец на дропе
+  shakeRingStretch: 0.14,     // деформация колец в эллипсы
+  shakeScreenOffset: 7,       // px — тряска всей сцены
+  logoRadiusRatio: 0.13,      // радиус логотипа от min(w, h)
+  logoColor: '#fc3f1d',       // фирменный красный
+
   // Фон
   bgInner: '#16110d',
   bgOuter: '#0a0807',
@@ -217,6 +230,7 @@ const hudBarFill = document.getElementById('hud-bar-fill');
 const hudYears = document.getElementById('hud-years');
 
 const N = CONFIG.ringCount;
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 
 const view = {
   width: 0, height: 0, dpr: 1,
@@ -260,12 +274,290 @@ const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
 const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
 const smoothstep = (t) => t * t * (3 - 2 * t);
+const mix = lerp;
+const clamp01 = (v) => clamp(v, 0, 1);
 
 function yearsWord(n) {
   const m10 = n % 10, m100 = n % 100;
   if (m10 === 1 && m100 !== 11) return 'год';
   if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'года';
   return 'лет';
+}
+
+// =====================================================================
+// Пасхалка: быстрое движение мыши → логотип Яндекса с глитчами + Harlem Shake.
+// Сначала «танцует один» логотип, через shakeDropDelay — дроп: трясётся всё.
+// =====================================================================
+const shake = {
+  wasActivePointer: false,
+  lastX: 0, lastY: 0,
+  speed: 0,                            // сглаженная скорость курсора, экранов/с
+  energy: 0,                           // заряд 0..1
+  active: false,                       // эпизод идёт
+  time: 0,                             // мс с начала эпизода
+  logoMix: 0,                          // видимость логотипа
+  dropMix: 0,                          // сила дропа
+  dropAt: -1,                          // state.time начала дропа
+  beatIndex: -1,
+  beatPulse: 0,                        // 1 на ударе, затухает до следующего
+  colorShift: 0,                       // перетасовка цветов колец на ударе
+  jitterTimer: 0,
+  screenDx: 0, screenDy: 0,
+  ringBase: new Float32Array(N * 4),   // dx, dy, sx, sy — задаются на ударе
+  ringCur: new Float32Array(N * 4),    // + мелкий дребезг между ударами
+  logoJit: new Float32Array(3),        // поворот, dx, dy логотипа
+  glitch: 0,
+  glitchTimer: 0,
+  rgbOffset: 0,
+  slices: new Float32Array(16 * 3),    // y, h, dx горизонтальных полос
+  sliceCount: 0,
+  blocks: new Float32Array(4 * 5),     // x, y, w, h, цвет
+  blockCount: 0,
+};
+
+const logo = { main: null, red: null, cyan: null, size: 0 };
+const GLITCH_COLORS = ['#fc3f1d', '#00e1ff', '#ffffff'];
+
+const rand = (a) => (Math.random() * 2 - 1) * a;
+const easeOutBack = (t) => {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+};
+
+// Логотип рендерим один раз в offscreen-канвасы: основной и два цветных «призрака» для RGB-сдвига
+function buildLogo() {
+  const R = Math.max(12, Math.round(Math.min(view.width, view.height) * CONFIG.logoRadiusRatio));
+  const size = Math.round(R * 2.7);
+  logo.size = size;
+  logo.main = makeLogoCanvas(size, R, 'main');
+  logo.red = makeLogoCanvas(size, R, 'red');
+  logo.cyan = makeLogoCanvas(size, R, 'cyan');
+}
+
+function makeLogoCanvas(size, R, kind) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(size * view.dpr);
+  c.height = c.width;
+  const g = c.getContext('2d');
+  g.scale(view.dpr, view.dpr);
+  const m = size / 2;
+
+  // Красный круг
+  if (kind === 'main') {
+    g.shadowColor = 'rgba(252, 63, 29, 0.55)';
+    g.shadowBlur = R * 0.35;
+  }
+  g.fillStyle = kind === 'main' ? CONFIG.logoColor : kind === 'red' ? '#ff1a4b' : '#00e1ff';
+  g.beginPath();
+  g.arc(m, m, R, 0, Math.PI * 2);
+  g.fill();
+  g.shadowBlur = 0;
+
+  // Буква «Я» по центру
+  g.font = `700 ${Math.round(R * 1.3)}px ${FONT}`;
+  g.textAlign = 'center';
+  g.textBaseline = 'alphabetic';
+  const mt = g.measureText('Я');
+  const asc = mt.actualBoundingBoxAscent || R * 0.9;
+  const desc = mt.actualBoundingBoxDescent || 0;
+  const y = m + (asc - desc) / 2;
+  if (kind === 'main') {
+    g.fillStyle = '#ffffff';
+  } else {
+    g.globalCompositeOperation = 'destination-out'; // у «призраков» буква вырезана
+  }
+  g.fillText('Я', m + R * 0.02, y);
+  return c;
+}
+
+function updateShake(dt) {
+  // Скорость курсора в экранах/с (не зависит от размера окна)
+  const minSide = Math.max(1, Math.min(view.width, view.height));
+  let v = 0;
+  if (pointer.active && shake.wasActivePointer && dt > 0) {
+    v = Math.hypot(pointer.x - shake.lastX, pointer.y - shake.lastY) / dt * 1000 / minSide;
+  }
+  shake.wasActivePointer = pointer.active;
+  shake.lastX = pointer.x;
+  shake.lastY = pointer.y;
+  shake.speed = mix(shake.speed, v, 1 - Math.exp(-dt / 70));
+
+  // Заряд: копится, пока трясёшь, и медленно стекает
+  const over = clamp01((shake.speed - CONFIG.shakeSpeedMin) / (CONFIG.shakeSpeedFull - CONFIG.shakeSpeedMin));
+  if (shake.speed > CONFIG.shakeSpeedMin) {
+    shake.energy = Math.min(1, shake.energy + dt / CONFIG.shakeChargeTime * (0.5 + over));
+  } else {
+    shake.energy = Math.max(0, shake.energy - dt / CONFIG.shakeDecayTime);
+  }
+
+  if (!shake.active && shake.energy >= 1) {
+    shake.active = true;
+    shake.time = 0;
+    shake.dropAt = -1;
+  } else if (shake.active && shake.energy <= 0) {
+    shake.active = false;
+  }
+
+  if (shake.active) {
+    shake.time += dt;
+    if (shake.dropAt < 0 && shake.time >= CONFIG.shakeDropDelay) {
+      shake.dropAt = state.time;          // ДРОП
+      shake.beatIndex = -1;
+    }
+  }
+
+  const dropOn = shake.active && shake.dropAt >= 0;
+  shake.logoMix = mix(shake.logoMix, shake.active ? 1 : 0, 1 - Math.exp(-dt / (shake.active ? 90 : 220)));
+  shake.dropMix = mix(shake.dropMix, dropOn ? 1 : 0, 1 - Math.exp(-dt / (dropOn ? 50 : 300)));
+
+  // Ритм дропа: крупные перестановки на ударе, мелкий дребезг между ними
+  const beatMs = 60000 / CONFIG.shakeBpm;
+  if (shake.dropMix > 0.001 && shake.dropAt >= 0) {
+    const sinceDrop = state.time - shake.dropAt;
+    const beat = Math.floor(sinceDrop / beatMs);
+    const newBeat = beat !== shake.beatIndex;
+    shake.beatPulse = Math.exp(-(sinceDrop - beat * beatMs) / 110);
+
+    if (newBeat) {
+      shake.beatIndex = beat;
+      shake.colorShift = 1 + Math.floor(Math.random() * (N - 1));
+      for (let k = 0; k < N * 4; k++) shake.ringBase[k] = rand(1);
+    }
+    shake.jitterTimer -= dt;
+    if (newBeat || shake.jitterTimer <= 0) {
+      shake.jitterTimer = 40 + Math.random() * 40;
+      for (let k = 0; k < N * 4; k++) shake.ringCur[k] = shake.ringBase[k] + rand(0.3);
+      shake.screenDx = rand(CONFIG.shakeScreenOffset);
+      shake.screenDy = rand(CONFIG.shakeScreenOffset);
+      shake.logoJit[0] = rand(1);
+      shake.logoJit[1] = rand(1);
+      shake.logoJit[2] = rand(1);
+    }
+  } else {
+    shake.beatPulse = 0;
+    shake.screenDx = 0;
+    shake.screenDy = 0;
+  }
+
+  // Глитч: всплеск при появлении, слабый в интро, сильный на дропе
+  if (shake.logoMix > 0.01) {
+    const appear = shake.active ? Math.exp(-shake.time / 260) : 1 - shake.logoMix;
+    shake.glitch = Math.max(0.3, appear, shake.dropMix * (0.55 + 0.45 * shake.beatPulse));
+    shake.glitchTimer -= dt;
+    if (shake.glitchTimer <= 0) {
+      shake.glitchTimer = 45 + Math.random() * 90;
+      rollGlitch(shake.glitch);
+    }
+  }
+}
+
+// Случайная раскладка глитча — держится 45–135 мс, потом перебрасывается
+function rollGlitch(g) {
+  const s = logo.size;
+  const calm = Math.random() > 0.3 + 0.6 * g;
+  shake.rgbOffset = (calm ? 0.2 : 1) * g * s * 0.045 * (0.5 + Math.random());
+  shake.sliceCount = 0;
+  shake.blockCount = 0;
+  if (calm) return;
+
+  let y = 0, k = 0;
+  while (y < s && k < 16) {
+    const h = k === 15 ? s - y : Math.min(s - y, s * (0.03 + Math.random() * 0.14));
+    shake.slices[k * 3] = y;
+    shake.slices[k * 3 + 1] = h;
+    shake.slices[k * 3 + 2] = Math.random() < 0.45 ? rand(s * 0.18 * g) : 0;
+    y += h;
+    k++;
+  }
+  shake.sliceCount = k;
+
+  const blocks = Math.floor(Math.random() * 4 * g);
+  for (let b = 0; b < blocks; b++) {
+    const o = b * 5;
+    shake.blocks[o] = rand(s * 0.45);
+    shake.blocks[o + 1] = rand(s * 0.45);
+    shake.blocks[o + 2] = s * (0.08 + Math.random() * 0.3);
+    shake.blocks[o + 3] = s * (0.01 + Math.random() * 0.04);
+    shake.blocks[o + 4] = Math.floor(Math.random() * GLITCH_COLORS.length);
+  }
+  shake.blockCount = blocks;
+}
+
+function drawLogo() {
+  if (shake.logoMix < 0.01 || !logo.main) return;
+
+  const s = logo.size;
+  const half = s / 2;
+  const dm = shake.dropMix;
+  const beatMs = 60000 / CONFIG.shakeBpm;
+
+  // Интро: логотип «танцует один» — покачивается в такт
+  const bob = Math.sin(state.time / beatMs * Math.PI);
+  let rot = bob * 0.12 * (1 - dm);
+  let ox = 0;
+  let oy = -Math.abs(bob) * 6 * (1 - dm);
+  let sc = mix(0.6, 1, easeOutBack(clamp01(shake.logoMix)));
+
+  // Дроп: логотип колбасит
+  if (dm > 0) {
+    rot += shake.logoJit[0] * 0.35 * dm;
+    ox += shake.logoJit[1] * s * 0.08 * dm;
+    oy += shake.logoJit[2] * s * 0.08 * dm;
+    sc *= 1 + 0.18 * shake.beatPulse * dm;
+  }
+
+  ctx.save();
+  ctx.translate(view.cx + ox, view.cy + oy);
+  ctx.rotate(rot);
+  ctx.scale(sc, sc);
+
+  const a = clamp01(shake.logoMix);
+
+  // RGB-сдвиг: красный и голубой «призраки» в разные стороны
+  const off = shake.rgbOffset;
+  if (off > 0.3) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = a * 0.75;
+    ctx.drawImage(logo.red, -half - off, -half + off * 0.3, s, s);
+    ctx.drawImage(logo.cyan, -half + off, -half - off * 0.3, s, s);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // Основной логотип — целиком или порезанный на сдвинутые полосы
+  ctx.globalAlpha = a;
+  if (shake.sliceCount > 0) {
+    const d = logo.main.width / s;
+    for (let k = 0; k < shake.sliceCount; k++) {
+      const y = shake.slices[k * 3];
+      const h = shake.slices[k * 3 + 1];
+      const dx = shake.slices[k * 3 + 2];
+      if (h * d < 1) continue;
+      ctx.drawImage(logo.main, 0, y * d, logo.main.width, h * d, -half + dx, -half + y, s, h);
+    }
+  } else {
+    ctx.drawImage(logo.main, -half, -half, s, s);
+  }
+
+  // Цифровой мусор
+  for (let b = 0; b < shake.blockCount; b++) {
+    const o = b * 5;
+    ctx.globalAlpha = a * 0.55;
+    ctx.fillStyle = GLITCH_COLORS[shake.blocks[o + 4]];
+    ctx.fillRect(shake.blocks[o], shake.blocks[o + 1], shake.blocks[o + 2], shake.blocks[o + 3]);
+  }
+
+  ctx.restore();
+}
+
+// Вспышка в момент дропа + красный отблеск на каждом ударе
+function drawDropFlash() {
+  if (shake.dropAt < 0 || shake.dropMix < 0.01) return;
+  const f = 1 - clamp01((state.time - shake.dropAt) / 350);
+  const a = 0.35 * f * f + 0.07 * shake.beatPulse * shake.dropMix;
+  if (a < 0.005) return;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = f > 0 ? `rgba(255, 236, 225, ${a})` : `rgba(252, 63, 29, ${a})`;
+  ctx.fillRect(0, 0, view.width, view.height);
 }
 
 // =====================================================================
@@ -299,6 +591,8 @@ function resize() {
   v.addColorStop(0, 'rgba(0, 0, 0, 0)');
   v.addColorStop(1, `rgba(0, 0, 0, ${CONFIG.vignetteStrength})`);
   view.vignette = v;
+
+  buildLogo();
 }
 
 // =====================================================================
@@ -396,6 +690,7 @@ function update(dt) {
   const pk = 1 - Math.exp(-dt / 120);
   pointer.alpha = lerp(pointer.alpha, pointer.active ? 1 : 0, pk);
 
+  updateShake(dt);
   updateHud();
 }
 
@@ -439,7 +734,13 @@ function draw() {
   ctx.fillStyle = view.bgGradient;
   ctx.fillRect(0, 0, view.width, view.height);
 
+  // Пасхалка: тряска всей сцены, логотип и вспышка дропа
+  ctx.save();
+  ctx.translate(shake.screenDx * shake.dropMix, shake.screenDy * shake.dropMix);
   drawRings();
+  drawLogo();
+  ctx.restore();
+  drawDropFlash();
 
   // Виньетка
   ctx.globalAlpha = 1;
@@ -465,6 +766,11 @@ function drawRings() {
   }
   const omega = 2 * Math.PI * CONFIG.pulseFrequency / 1000; // рад/мс
 
+  // Пасхалка: на дропе кольца разлетаются, мнутся в эллипсы и меняются цветами
+  const dm = shake.dropMix;
+  const shakeAmp = CONFIG.shakeRingOffset * Math.min(view.width, view.height) / 800 *
+    dm * (0.6 + 0.6 * shake.beatPulse);
+
   for (let i = 0; i < state.visible; i++) {
     // Уровень 2: анимация появления — easeOutCubic по радиусу, fade-in по альфе
     const p = clamp((state.time - state.birthTimes[i]) / CONFIG.appearDuration, 0, 1);
@@ -484,8 +790,18 @@ function drawRings() {
     const lw = Math.min(lerp(CONFIG.lineWidthMin, CONFIG.lineWidthMax, i / (N - 1)), widthCap);
 
     ctx.beginPath();
-    ctx.arc(view.cx, view.cy, r, 0, Math.PI * 2);
-    ctx.strokeStyle = ringColors[i];
+    if (dm > 0.001) {
+      const j = i * 4;
+      const sx = 1 + shake.ringCur[j + 2] * CONFIG.shakeRingStretch * dm;
+      const sy = 1 + shake.ringCur[j + 3] * CONFIG.shakeRingStretch * dm;
+      ctx.ellipse(
+        view.cx + shake.ringCur[j] * shakeAmp, view.cy + shake.ringCur[j + 1] * shakeAmp,
+        r * sx, r * sy, 0, 0, Math.PI * 2
+      );
+    } else {
+      ctx.arc(view.cx, view.cy, r, 0, Math.PI * 2);
+    }
+    ctx.strokeStyle = ringColors[dm > 0.5 ? (i + shake.colorShift) % N : i];
 
     // Проход 1: мягкое свечение — широкая полупрозрачная линия
     ctx.globalCompositeOperation = 'lighter';
